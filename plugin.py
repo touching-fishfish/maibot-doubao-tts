@@ -18,7 +18,7 @@ import logging
 import random
 import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import aiohttp
 from pydantic import field_validator
@@ -506,6 +506,90 @@ class BehaviorSectionConfig(PluginConfigBase):
     )
 
 
+class NaturalSectionConfig(PluginConfigBase):
+    """自然度配置：用"上文情景"与"口语化改写"消除捧读感。"""
+
+    __ui_label__ = "自然度（去捧读）"
+    __ui_icon__ = "sparkles"
+    __ui_order__ = 6
+
+    context_enabled: bool = Field(
+        default=True,
+        description=(
+            "给合成请求附加「引用上文」：一段只作为语境、不会被朗读的文字，"
+            "让模型按情境决定语气（实测有效，比下语音指令靠谱）。"
+        ),
+        json_schema_extra={
+            "label": "上文情景",
+            "hint": (
+                "开启后每次合成会附带一段情境描述（如“对方刚说加班很累，你在安慰他”），"
+                "模型据此调整重音与语气。实测：同一句台词加上文后情绪明显更足。"
+                "注意：上文按字符计费（很短，可忽略）。"
+            ),
+        },
+    )
+    context_source: Literal["llm", "fixed"] = Field(
+        default="llm",
+        description="上文来源：llm=麦麦自主语音时由 LLM 现场写一句情境；fixed=用固定的上文文案",
+        json_schema_extra={
+            "label": "上文来源",
+            "options": {
+                "llm": {"label": "麦麦现场写（推荐）", "description": "由 LLM 根据当前对话写一句情境描述"},
+                "fixed": {"label": "固定文案", "description": "始终使用「固定上文」里写的内容"},
+            },
+        },
+    )
+    fixed_context: str = Field(
+        default="",
+        description="固定上文文案（context_source=fixed 时使用）",
+        json_schema_extra={
+            "label": "固定上文",
+            "placeholder": "例如：亲密的朋友在闲聊，语气轻松自然",
+            "hint": "只在「上文来源=固定文案」时生效；手动 /说 命令也会带上它。",
+        },
+    )
+    style_enabled: bool = Field(
+        default=True,
+        description=(
+            "合成前先把回复改写成口语短句，并用逗号、破折号、省略号制造停顿，"
+            "解决“书面文字念出来发平”的问题。"
+        ),
+        json_schema_extra={
+            "label": "口语化改写",
+            "hint": (
+                "会多一次小模型调用（约几十 token）。改写只调整断句和口语词，不改原意、不加信息；"
+                "失败自动回退原文，不影响发声。"
+            ),
+        },
+    )
+    style_mode: Literal["punctuation", "rewrite"] = Field(
+        default="punctuation",
+        description=(
+            "改写方式：punctuation=只加停顿标点，一个字不改（推荐，语气词保留原文分寸）；"
+            "rewrite=允许收语气词、换口语词（更利落，但可能变冷淡）"
+        ),
+        json_schema_extra={
+            "label": "改写方式",
+            "options": {
+                "punctuation": {"label": "仅加标点（推荐）", "description": "不改任何字词，只把停顿补上，关键处用破折号"},
+                "rewrite": {"label": "口语改写", "description": "允许缩句、收语气词、换口语词，更利落但风险更高"},
+            },
+        },
+    )
+    style_model_task: str = Field(
+        default="utils",
+        description="口语化改写使用的模型任务名（默认 utils，便宜快）",
+        json_schema_extra={"label": "改写模型任务"},
+    )
+    style_max_chars: int = Field(
+        default=150,
+        ge=20,
+        le=300,
+        description="口语化改写后的最大长度（超出截断），建议与「单条最大字数」一致",
+        json_schema_extra={"label": "改写后最大字数"},
+    )
+
+
 class DoubaoTTSRootConfig(PluginConfigBase):
     """插件根配置。"""
 
@@ -515,6 +599,7 @@ class DoubaoTTSRootConfig(PluginConfigBase):
     speed_loud: SpeedLoudSectionConfig = Field(default_factory=SpeedLoudSectionConfig, json_schema_extra={"label": "语速与音量"})
     translate: TranslateSectionConfig = Field(default_factory=TranslateSectionConfig, json_schema_extra={"label": "语音翻译"})
     behavior: BehaviorSectionConfig = Field(default_factory=BehaviorSectionConfig, json_schema_extra={"label": "行为"})
+    natural: NaturalSectionConfig = Field(default_factory=NaturalSectionConfig, json_schema_extra={"label": "自然度（去捧读）"})
 
 
 # ─── 主插件 ──────────────────────────────────────────────────────────────────
@@ -531,6 +616,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self._pending_voice: Dict[str, float] = {}
         # 防递归：正在发送"概率语音"的标记
         self._sending_pending_voice: bool = False
+        # 会话 → 对方最近一句话（作为「引用上文」喂给合成，让语气贴合语境）
+        self._last_inbound: Dict[str, str] = {}
 
     # ── 配置读取 ────────────────────────────────────────────────────────
 
@@ -610,6 +697,8 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         text, session_id = await self._extract_message_text(message)
         if not text or not session_id:
             return
+        # 记录对方原话：无论是否概率模式，都留作「引用上文」的语境
+        self._last_inbound[session_id] = text
         if not self._probability_enabled():
             return
         if self._roll_probability():
@@ -706,7 +795,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
     # ── 火山合成 ────────────────────────────────────────────────────────
 
     async def _synthesize_one(
-        self, text: str, overrides: Optional[Dict[str, Any]] = None
+        self, text: str, overrides: Optional[Dict[str, Any]] = None, context: Optional[Sequence[str]] = None
     ) -> Tuple[bool, bytes, str]:
         """调用火山新版接口合成一段音频。
 
@@ -791,6 +880,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if detected_lang:
             additions["explicit_language"] = detected_lang
         req_params["additions"] = json.dumps(additions, ensure_ascii=False)
+        # 引用上文：只作语境、不会被朗读；实测能显著改善语气与重音
+        if context:
+            req_params["context_texts"] = [c for c in context if c][:2]
 
         headers = {
             "Content-Type": "application/json",
@@ -887,7 +979,13 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             self.ctx.logger.error("[豆包TTS] 发送语音失败: %s", exc)
             return False
 
-    async def _speech(self, text: str, stream_id: str, overrides: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+    async def _speech(
+        self,
+        text: str,
+        stream_id: str,
+        overrides: Optional[Dict[str, Any]] = None,
+        context: Optional[Sequence[str]] = None,
+    ) -> Tuple[bool, str]:
         """把整段文本切成多条语音逐段发送。返回 (是否全部成功, 说明)。"""
         max_len = max(1, int(self._get("behavior", "max_text_length", 150) or 150))
         segments = _split_sentences(text, max_len)
@@ -897,7 +995,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         ok = 0
         last_voice = ""
         for i, seg in enumerate(segments):
-            success, audio, info = await self._synthesize_one(seg, overrides=overrides)
+            success, audio, info = await self._synthesize_one(seg, overrides=overrides, context=context)
             if not success:
                 self.ctx.logger.warning("[豆包TTS] 第 %d/%d 段失败: %s", i + 1, total, info)
                 continue
@@ -910,6 +1008,67 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         if ok > 0:
             return True, f"部分成功 {ok}/{total}"
         return False, "合成失败"
+
+    def _build_context(self, situation: str, stream_id: str) -> Optional[List[str]]:
+        """组装「引用上文」：对方原话 + 情境描述（都只作语境，不被朗读）。"""
+        if not bool(self._get("natural", "context_enabled", True)):
+            return None
+        if str(self._get("natural", "context_source", "llm") or "llm") == "fixed":
+            fixed = str(self._get("natural", "fixed_context", "") or "").strip()
+            return [fixed] if fixed else None
+        parts: List[str] = []
+        last = (self._last_inbound.get(stream_id) or "").strip()
+        if last:
+            parts.append(f"对方刚说：{last}")
+        text = (situation or "").strip()
+        if text:
+            parts.append(text)
+        return parts[:2] or None
+
+    async def _style_text(self, text: str) -> str:
+        """调整合成文本：默认只补停顿标点；可选口语改写。失败一律回退原文。"""
+        if not bool(self._get("natural", "style_enabled", True)):
+            return text
+        max_chars = max(20, int(self._get("natural", "style_max_chars", 150) or 150))
+        if len(text) <= 12:
+            return text
+        mode = str(self._get("natural", "style_mode", "punctuation") or "punctuation").strip()
+        if mode == "rewrite":
+            prompt = (
+                "把下面这段话改写成真人当面讲话的样子。只调停顿、缩句和口语词，不改意思、不加内容。\n"
+                "【缩句】允许收掉啰嗦的语气词让句子利落，但不要删实词，不要把一句话拆成碎片。\n"
+                "【断句】只在语义完整处停顿，绝不在「的」「了」「吗」「吧」后停，绝不拆开主语和谓语；"
+                "一个气口 10~25 字，全句最多 3 处停顿。\n"
+                "【重音】关键信息（原因、数字、状态、情绪）要用逗号或破折号单独拎出来，让它被重读。\n"
+                "【省略号】只在真的拖长、犹豫、没说完时用；不要用省略号弱化语气。\n"
+                "【结尾】句子结尾要有力，不要用「……」收尾。\n"
+                f"去掉 Markdown 和引号。总长度不超过 {max_chars} 字。只输出改写后的文本。\n\n{text}"
+            )
+        else:
+            # 仅加标点：一个字不改，避免改写层把语气词收成"冷淡"或加满成"假"
+            prompt = (
+                "你是标点编辑。只给下面这段话加停顿标点，一个字都不要改、不要增、不要删。\n"
+                "规则：\n"
+                "1. 只用逗号、破折号（——）、问号；不要加省略号；\n"
+                "2. 只在语义完整处加逗号，绝不把主语和谓语隔开（「你今天怎么这么晚才回我」不能加逗号）；\n"
+                "3. 关键信息（原因、数字、状态、情绪）前后可以各加一个逗号，让它被重读；\n"
+                "4. 每句最多 2 个逗号，不要切碎；\n"
+                "5. 不要改动任何汉字、语气词或标点以外的符号。\n"
+                f"总长度不超过 {max_chars} 字。只输出加好标点的文本，不要任何说明。\n\n"
+                f"{text}"
+            )
+        try:
+            out = await self._call_llm(prompt, max(120, min(800, max_chars * 2)))
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("[豆包TTS] 文本调整失败（用原文）: %s", exc)
+            return text
+        out = (out or "").strip().strip("\"“”")
+        if not out:
+            self.ctx.logger.warning("[豆包TTS] 文本调整为空（用原文）")
+            return text
+        if out != text:
+            self.ctx.logger.info("[豆包TTS] 文本调整(%s): %s → %s", mode, text[:40], out[:40])
+        return out[:max_chars]
 
     def _translate_mode(self) -> str:
         """当前翻译方式：不翻译 / 全部翻译 / 按概率翻译 / 由麦麦判断。"""
@@ -1008,7 +1167,12 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         return out
 
     async def _handle_speech(
-        self, text: str, stream_id: str, source: str, overrides: Optional[Dict[str, Any]] = None
+        self,
+        text: str,
+        stream_id: str,
+        source: str,
+        overrides: Optional[Dict[str, Any]] = None,
+        situation: str = "",
     ) -> Tuple[bool, str]:
         """统一入口（手动命令 / Tool 都走这里）。
 
@@ -1032,9 +1196,13 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         self.ctx.logger.info(
             "[豆包TTS] %s 触发语音: %d字 覆盖=%s", source, len(text), json.dumps({k: v for k, v in ov.items() if v is not None}, ensure_ascii=False) or "-"
         )
+        # 口语化改写（可选）：把书面长句改成口语短句并用标点制造停顿
+        styled_text = await self._style_text(text)
         # 语音翻译（可选）：开启后先把文本翻成目标语种，再用音色说出来
-        tts_text = await self._translate_if_needed(text)
-        ok, note = await self._speech(tts_text, stream_id, overrides=ov)
+        tts_text = await self._translate_if_needed(styled_text)
+        # 引用上文（可选）：对方原话 + 情境，只作为语境，不被朗读
+        context = self._build_context(situation, stream_id)
+        ok, note = await self._speech(tts_text, stream_id, overrides=ov, context=context)
         if ok:
             return True, note
         # 失败处理
@@ -1104,6 +1272,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             f"- 当前音色：{self._get('voice_tone', 'voice', DEFAULT_VOICE_DISPLAY)}"
             f"（Resource ID：{self._get('doubao', 'resource_id', DOUBAO_RESOURCE_PRESET)}）\n"
             f"- 语音翻译：{translate_line}\n"
+            f"- 上文情景：{'开' if self._get('natural', 'context_enabled', True) else '关'}"
+            f"（来源：{self._get('natural', 'context_source', 'llm')}）\n"
+            f"- 口语化改写：{'开' if self._get('natural', 'style_enabled', True) else '关'}\n"
             f"- 预置音色：{voice_list}\n"
             f"- 情感（可选）：{emotion_list}\n"
             "- 换音色/情感/翻译：WebUI 插件配置里修改即可（改完即时生效）"
@@ -1121,6 +1292,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             "当用户明确要求“用语音/说话/朗读/语音回复”时使用。"
             "文本宜为一句完整的话（5~80字）。若内容很长（>150字），只取其中最想强调的一句话来朗读，其余仍用文字。"
             "可选按对话氛围调节语气：emotion（情感，如安慰时平静、玩闹时开心）、emotion_scale（强度1~5，配合 emotion）。"
+            "situation：一句话写清当下情境与对方情绪（不会朗读出来，只让声音更自然，强烈建议填）。"
             "每个参数可单独给，未给的使用插件配置里的固定值；拿不准就都省略，用默认语气即可。"
             "（语速、音量为固定设置，不由本工具调节。）"
         ),
@@ -1144,6 +1316,15 @@ class DoubaoTTSPlugin(MaiBotPlugin):
                 description="可选：情感强度 1~5（配合 emotion 使用，1=最淡）",
                 required=False,
             ),
+            ToolParameterInfo(
+                name="situation",
+                param_type=ToolParamType.STRING,
+                description=(
+                    "可选：一句话描述当下的情境与对方情绪（如“对方刚加班到深夜、很累，你在心疼地劝他休息”）。"
+                    "只作为语气参考，不会被朗读出来，能让声音更自然。"
+                ),
+                required=False,
+            ),
         ],
     )
     async def _tool_speak(
@@ -1151,6 +1332,7 @@ class DoubaoTTSPlugin(MaiBotPlugin):
         text: str = "",
         emotion: str = "",
         emotion_scale: Any = None,
+        situation: str = "",
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """LLM 调用：返回结构化结果给 LLM。"""
@@ -1172,7 +1354,9 @@ class DoubaoTTSPlugin(MaiBotPlugin):
             overrides["emotion"] = (emotion or "").strip()
         if self._get("behavior", "emotion_scale_mode", "fixed") == "auto" and emotion_scale is not None:
             overrides["emotion_scale"] = emotion_scale
-        ok, note = await self._handle_speech(text, stream_id, "Tool", overrides=overrides or None)
+        ok, note = await self._handle_speech(
+            text, stream_id, "Tool", overrides=overrides or None, situation=situation
+        )
         if ok:
             return {"success": True, "message": note}
         return {"success": False, "message": f"语音失败：{note}"}
